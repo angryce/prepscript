@@ -1,0 +1,409 @@
+#!/bin/sh
+# prep-template.sh — prepare a Proxmox VM to be converted into a template.
+#
+# Supported: Debian 12/13, Ubuntu 24.04/26.04, AlmaLinux 8/9/10
+#
+# What it does:
+#   - detects the OS / package manager / admin group (sudo or wheel)
+#   - installs sudo, openssh-server, qemu-guest-agent, cloud-init, growpart (+ curl if missing)
+#   - creates the user angryce, adds it to the admin group, pulls its keys from GitHub
+#   - sudoers drop-in: admin group gets NOPASSWD
+#   - sshd: pubkey auth on, root login off, password auth off (configurable)
+#   - locks the root password (community VM images ship root with an EMPTY password)
+#   - cleans package caches, logs, cloud-init state, SSH host keys, machine-id, tmp, history
+#
+# Run as root inside the VM (NOT on the Proxmox host):
+#   sh prep-template.sh        # asks for confirmation
+#   sh prep-template.sh -y     # no confirmation
+
+set -eu
+
+# ---------------------------------------------------------------- settings --
+TEMPLATE_USER="angryce"
+GITHUB_USER="angryce"
+DISABLE_PASSWORD_AUTH="yes"   # yes = key-only SSH
+LOCK_ROOT_PASSWORD="yes"      # yes = root can't log in on the console either
+UPGRADE_PACKAGES="yes"        # yes = full upgrade before templating
+ASSUME_YES="no"
+
+# ----------------------------------------------------------------- helpers --
+log()  { printf '\033[1;32m==>\033[0m %s\n' "$*"; }
+warn() { printf '\033[1;33m[!]\033[0m %s\n' "$*" >&2; }
+die()  { printf '\033[1;31m[x]\033[0m %s\n' "$*" >&2; exit 1; }
+
+usage() {
+    # Inline (not read from $0) so -h also works via: bash -c "$(curl -fsSL <url>)" _ -h
+    cat <<'EOF'
+prep-template.sh: prepare a Proxmox VM (Debian 12/13, Ubuntu 24.04/26.04, AlmaLinux) for templating.
+
+Usage:
+  sh prep-template.sh [-y]
+  bash -c "$(curl -fsSL <raw-url>)" _ [-y]
+
+Options:
+  -y, --yes   don't ask for confirmation
+  -h, --help  show this help
+EOF
+    exit 0
+}
+
+for arg in "$@"; do
+    case "$arg" in
+        -y|--yes)  ASSUME_YES="yes" ;;
+        -h|--help) usage ;;
+        *)         die "Unknown option: $arg (try -h)" ;;
+    esac
+done
+
+# --------------------------------------------------------------- preflight --
+[ "$(id -u)" -eq 0 ] || die "Run this as root."
+
+if [ -d /etc/pve ] || command -v pveversion >/dev/null 2>&1; then
+    die "This looks like the Proxmox host. Run it inside the VM you want to template."
+fi
+
+# --------------------------------------------------------------- OS detect --
+detect_os() {
+    [ -r /etc/os-release ] || die "/etc/os-release not found, can't detect the OS."
+    # shellcheck disable=SC1091
+    . /etc/os-release
+    OS_ID="${ID:-unknown}"
+    OS_VER="${VERSION_ID:-unknown}"
+    OS_MAJOR="${OS_VER%%.*}"
+    OS_NAME="${PRETTY_NAME:-$OS_ID $OS_VER}"
+
+    case "$OS_ID" in
+        debian)
+            PKG="apt"; SUDO_GROUP="sudo"
+            case "$OS_MAJOR" in 12|13) ;; *) warn "Debian $OS_VER is untested, continuing anyway." ;; esac
+            ;;
+        ubuntu)
+            PKG="apt"; SUDO_GROUP="sudo"
+            case "$OS_VER" in 24.04|26.04) ;; *) warn "Ubuntu $OS_VER is untested, continuing anyway." ;; esac
+            ;;
+        almalinux)
+            PKG="dnf"; SUDO_GROUP="wheel"
+            case "$OS_MAJOR" in 8|9|10) ;; *) warn "AlmaLinux $OS_VER is untested, continuing anyway." ;; esac
+            ;;
+        *)
+            # Fall back on ID_LIKE for close relatives (Rocky, Mint, ...)
+            case " ${ID_LIKE:-} " in
+                *" debian "*|*" ubuntu "*)          PKG="apt"; SUDO_GROUP="sudo" ;;
+                *" rhel "*|*" fedora "*|*" centos "*) PKG="dnf"; SUDO_GROUP="wheel" ;;
+                *) die "Unsupported OS: $OS_NAME" ;;
+            esac
+            warn "$OS_NAME isn't on the tested list, treating it as a $PKG-based distro."
+            ;;
+    esac
+    log "Detected: $OS_NAME (package manager: $PKG)"
+}
+
+resolve_sudo_group() {
+    # Prefer the distro default; fall back to whichever admin group exists.
+    if ! getent group "$SUDO_GROUP" >/dev/null 2>&1; then
+        for g in sudo wheel; do
+            if getent group "$g" >/dev/null 2>&1; then SUDO_GROUP="$g"; break; fi
+        done
+    fi
+    if ! getent group "$SUDO_GROUP" >/dev/null 2>&1; then
+        groupadd "$SUDO_GROUP"
+    fi
+    log "Admin group: $SUDO_GROUP"
+}
+
+# ---------------------------------------------------------------- packages --
+pkg_installed() {
+    case "$PKG" in
+        apt) dpkg-query -W -f='${Status}' "$1" 2>/dev/null | grep -q "install ok installed" ;;
+        dnf) rpm -q "$1" >/dev/null 2>&1 ;;
+    esac
+}
+
+install_packages() {
+    case "$PKG" in
+        apt) wanted="sudo openssh-server ca-certificates qemu-guest-agent cloud-init cloud-guest-utils" ;;
+        dnf) wanted="sudo openssh-server qemu-guest-agent cloud-init cloud-utils-growpart" ;;
+    esac
+    # Check the command, not the package: AlmaLinux ships curl-minimal, which conflicts with "curl".
+    if ! command -v curl >/dev/null 2>&1; then wanted="$wanted curl"; fi
+
+    missing=""
+    for p in $wanted; do
+        if ! pkg_installed "$p"; then missing="$missing $p"; fi
+    done
+
+    case "$PKG" in
+        apt)
+            export DEBIAN_FRONTEND=noninteractive
+            log "Updating package lists"
+            apt-get update -q
+            if [ "$UPGRADE_PACKAGES" = "yes" ]; then
+                log "Upgrading installed packages"
+                apt-get -y -q -o Dpkg::Options::=--force-confdef -o Dpkg::Options::=--force-confold full-upgrade
+            fi
+            if [ -n "$missing" ]; then
+                log "Installing:$missing"
+                # shellcheck disable=SC2086
+                apt-get -y -q install $missing
+            fi
+            ;;
+        dnf)
+            if [ "$UPGRADE_PACKAGES" = "yes" ]; then
+                log "Upgrading installed packages"
+                dnf -y -q upgrade
+            fi
+            if [ -n "$missing" ]; then
+                log "Installing:$missing"
+                # shellcheck disable=SC2086
+                dnf -y -q install $missing
+            fi
+            ;;
+    esac
+    if [ -z "$missing" ]; then log "All required packages already installed"; fi
+}
+
+# -------------------------------------------------------------------- user --
+setup_user() {
+    if id "$TEMPLATE_USER" >/dev/null 2>&1; then
+        log "User $TEMPLATE_USER exists, making sure it's in $SUDO_GROUP"
+        usermod -aG "$SUDO_GROUP" "$TEMPLATE_USER"
+    else
+        log "Creating user $TEMPLATE_USER"
+        useradd -m -s /bin/bash -G "$SUDO_GROUP" "$TEMPLATE_USER"
+    fi
+
+    # A fresh useradd leaves the password as "!" (locked). Swap that for "*":
+    # still no usable password, but sshd never treats the account as locked.
+    pw_field=$(getent shadow "$TEMPLATE_USER" | cut -d: -f2)
+    case "$pw_field" in
+        '!'*) usermod -p '*' "$TEMPLATE_USER" ;;
+    esac
+
+    HOME_DIR=$(getent passwd "$TEMPLATE_USER" | cut -d: -f6)
+    USER_GROUP=$(id -gn "$TEMPLATE_USER")
+}
+
+install_keys() {
+    url="https://github.com/${GITHUB_USER}.keys"
+    log "Fetching SSH keys from $url"
+    tmp=$(mktemp)
+    if ! curl -fsSL --retry 3 --connect-timeout 10 "$url" -o "$tmp"; then
+        rm -f "$tmp"; die "Couldn't download $url"
+    fi
+    if [ ! -s "$tmp" ] || ! ssh-keygen -lf "$tmp" >/dev/null 2>&1; then
+        rm -f "$tmp"
+        die "No valid public keys at $url. Stopping before SSH is locked down."
+    fi
+    count=$(grep -c . "$tmp")
+
+    ssh_dir="$HOME_DIR/.ssh"
+    ak="$ssh_dir/authorized_keys"
+    install -d -m 700 -o "$TEMPLATE_USER" -g "$USER_GROUP" "$ssh_dir"
+    touch "$ak"
+    # Merge with anything already there, drop duplicates and blank lines.
+    cat "$ak" "$tmp" | awk 'NF && !seen[$0]++' > "$ak.new"
+    cat "$ak.new" > "$ak"
+    rm -f "$ak.new" "$tmp"
+
+    chown -R "$TEMPLATE_USER:$USER_GROUP" "$ssh_dir"
+    chmod 700 "$ssh_dir"
+    chmod 600 "$ak"
+    chmod go-w "$HOME_DIR"          # sshd StrictModes rejects group/world-writable homes
+    if command -v restorecon >/dev/null 2>&1; then restorecon -R "$ssh_dir"; fi
+    log "Installed $count key(s) for $TEMPLATE_USER"
+}
+
+# ------------------------------------------------------------------ sudoers --
+configure_sudo() {
+    f="/etc/sudoers.d/90-${SUDO_GROUP}-nopasswd"
+    tmp=$(mktemp)
+    printf '# Managed by prep-template.sh\n%%%s ALL=(ALL:ALL) NOPASSWD: ALL\n' "$SUDO_GROUP" > "$tmp"
+    if ! visudo -cf "$tmp" >/dev/null; then
+        rm -f "$tmp"; die "Generated sudoers rule failed validation."
+    fi
+    install -m 440 -o root -g root "$tmp" "$f"
+    rm -f "$tmp"
+    if command -v restorecon >/dev/null 2>&1; then restorecon "$f"; fi
+
+    if ! grep -Eq '^[#@]includedir[[:space:]]+/etc/sudoers\.d' /etc/sudoers; then
+        warn "/etc/sudoers doesn't include /etc/sudoers.d. Add '@includedir /etc/sudoers.d' or the rule won't apply."
+    fi
+    visudo -c >/dev/null || die "sudoers check failed after adding $f"
+    log "sudo: %$SUDO_GROUP now has NOPASSWD ($f)"
+}
+
+# --------------------------------------------------------------------- sshd --
+configure_sshd() {
+    main=/etc/ssh/sshd_config
+    [ -f "$main" ] || die "$main not found."
+    pw="no"
+    if [ "$DISABLE_PASSWORD_AUTH" != "yes" ]; then pw="yes"; fi
+
+    settings="PermitRootLogin no
+PubkeyAuthentication yes
+AuthorizedKeysFile .ssh/authorized_keys
+PasswordAuthentication $pw
+KbdInteractiveAuthentication no
+PermitEmptyPasswords no"
+
+    cp -a "$main" "$main.bak-prep"
+    dropin=""
+
+    if grep -Eqi '^[[:space:]]*Include[[:space:]]+/etc/ssh/sshd_config\.d/' "$main"; then
+        # sshd uses the FIRST value it sees. 00-* sorts ahead of 01-permitrootlogin.conf
+        # (Alma) and 50-cloud-init.conf (written by cloud-init on first boot).
+        dropin=/etc/ssh/sshd_config.d/00-template.conf
+        printf '# Managed by prep-template.sh\n%s\n' "$settings" > "$dropin"
+        chmod 644 "$dropin"
+        log "sshd: wrote $dropin"
+    else
+        # No drop-in support (e.g. AlmaLinux 8): comment out our keys in the main
+        # file and put our block at the very top, ahead of any Match blocks.
+        for key in PermitRootLogin PubkeyAuthentication AuthorizedKeysFile PasswordAuthentication KbdInteractiveAuthentication PermitEmptyPasswords; do
+            sed -i -E "s/^[[:space:]]*(${key})([[:space:]])/#\1\2/I" "$main"
+        done
+        tmp=$(mktemp)
+        { printf '# Added by prep-template.sh\n%s\n\n' "$settings"; cat "$main"; } > "$tmp"
+        cat "$tmp" > "$main"        # cat (not mv) keeps permissions and SELinux label
+        rm -f "$tmp"
+        log "sshd: updated $main (no sshd_config.d include found)"
+    fi
+
+    sshd_bin=$(command -v sshd 2>/dev/null || echo /usr/sbin/sshd)
+    mkdir -p /run/sshd
+    if ! "$sshd_bin" -t; then
+        warn "sshd config test failed, rolling back."
+        cp -a "$main.bak-prep" "$main"
+        if [ -n "$dropin" ]; then rm -f "$dropin"; fi
+        die "sshd config invalid. Nothing changed in SSH."
+    fi
+
+    eff=$("$sshd_bin" -T 2>/dev/null || true)
+    echo "$eff" | grep -qx 'permitrootlogin no' \
+        || warn "Effective PermitRootLogin isn't 'no'. Check other files in /etc/ssh/sshd_config.d/"
+    echo "$eff" | grep -qx 'pubkeyauthentication yes' \
+        || warn "Effective PubkeyAuthentication isn't 'yes'."
+
+    systemctl try-reload-or-restart ssh.service sshd.service >/dev/null 2>&1 || true
+    log "sshd: root login off, pubkey on, password auth $( [ "$pw" = no ] && echo off || echo on )"
+}
+
+# ----------------------------------------------------------------- services --
+enable_services() {
+    # On Debian/Ubuntu the guest agent is a "static" unit started by udev once the
+    # virtio port exists, so "enable" may complain. That's fine.
+    systemctl enable qemu-guest-agent >/dev/null 2>&1 || true
+    if systemctl start qemu-guest-agent >/dev/null 2>&1; then
+        log "qemu-guest-agent running"
+    else
+        warn "qemu-guest-agent didn't start. Turn on 'QEMU Guest Agent' in the VM's Options and it'll start on boot."
+    fi
+
+    rm -f /etc/cloud/cloud-init.disabled
+    # Unit names changed in newer cloud-init (cloud-init-main / cloud-init-network); enable whichever exist.
+    for u in cloud-init-local cloud-init-main cloud-init cloud-init-network cloud-config cloud-final; do
+        systemctl enable "$u.service" >/dev/null 2>&1 || true
+    done
+    log "cloud-init enabled"
+
+    # Clones boot with no host keys. cloud-init normally regenerates them, but if a
+    # clone has no cloud-init drive, Debian/Ubuntu sshd won't start without keys.
+    cat > /etc/systemd/system/regen-ssh-hostkeys.service <<'EOF'
+[Unit]
+Description=Generate missing SSH host keys (template clones)
+After=cloud-init.service cloud-init-network.service
+Before=ssh.service sshd.service
+ConditionPathExistsGlob=!/etc/ssh/ssh_host_*_key
+
+[Service]
+Type=oneshot
+ExecStart=/usr/bin/ssh-keygen -A
+
+[Install]
+WantedBy=multi-user.target
+EOF
+    systemctl daemon-reload
+    systemctl enable regen-ssh-hostkeys.service >/dev/null 2>&1
+    log "Host key fallback service enabled"
+}
+
+lock_root() {
+    if [ "$LOCK_ROOT_PASSWORD" = "yes" ]; then
+        passwd -l root >/dev/null
+        log "root password locked (use $TEMPLATE_USER + sudo)"
+    fi
+}
+
+# ------------------------------------------------------------------ cleanup --
+cleanup() {
+    log "Cleaning up for templating"
+
+    case "$PKG" in
+        apt) apt-get -y -q autoremove --purge; apt-get -q clean ;;
+        dnf) dnf -y -q autoremove || true; dnf -q clean all ;;
+    esac
+
+    if command -v cloud-init >/dev/null 2>&1; then
+        cloud-init clean --logs --seed >/dev/null 2>&1 || cloud-init clean --logs >/dev/null 2>&1 || true
+    fi
+
+    journalctl --rotate >/dev/null 2>&1 || true
+    journalctl --vacuum-time=1s >/dev/null 2>&1 || true
+    # Delete rotated logs, empty the rest (leave the journal directory to journald).
+    find /var/log -path /var/log/journal -prune -o -type f \( \
+        -name '*.gz' -o -name '*.xz' -o -name '*.[0-9]' -o -name '*.old' \
+        -o -name '*-[0-9][0-9][0-9][0-9][0-9][0-9][0-9][0-9]' \) -exec rm -f {} +
+    find /var/log -path /var/log/journal -prune -o -type f -exec truncate -s 0 {} +
+
+    # Unique per clone: SSH host keys, machine-id (empty file = regenerated on boot), random seed, DHCP leases.
+    rm -f /etc/ssh/ssh_host_*
+    truncate -s 0 /etc/machine-id
+    if [ -d /var/lib/dbus ]; then
+        rm -f /var/lib/dbus/machine-id
+        ln -s /etc/machine-id /var/lib/dbus/machine-id
+    fi
+    rm -f /var/lib/systemd/random-seed
+    rm -f /var/lib/dhcp/*.leases /var/lib/dhclient/*.lease* /var/lib/NetworkManager/*.lease
+
+    find /tmp /var/tmp -mindepth 1 -delete 2>/dev/null || true
+    rm -f /root/.bash_history /root/.lesshst /root/.wget-hsts /root/.viminfo
+    rm -f "$HOME_DIR/.bash_history"
+
+    fstrim -a >/dev/null 2>&1 || true   # lets thin-provisioned storage reclaim freed space
+    rm -f /etc/ssh/sshd_config.bak-prep
+}
+
+# --------------------------------------------------------------------- main --
+detect_os
+
+if [ "$ASSUME_YES" != "yes" ]; then
+    printf '\nThis will lock down SSH and root, create %s, and wipe logs, host keys and machine-id.\n' "$TEMPLATE_USER"
+    printf 'Only run it on a VM you are about to turn into a template. Continue? [y/N] '
+    ans=""
+    read -r ans < /dev/tty || true
+    case "$ans" in y|Y|yes|YES) ;; *) die "Aborted." ;; esac
+fi
+
+install_packages
+resolve_sudo_group
+setup_user
+install_keys        # dies here (before any lockdown) if GitHub keys can't be fetched
+configure_sudo
+configure_sshd
+enable_services
+lock_root
+cleanup
+
+cat <<EOF
+
+$(printf '\033[1;32m')Done.$(printf '\033[0m') Finish with (so this shell's history isn't saved):
+
+    unset HISTFILE; poweroff
+
+Then on the Proxmox host:
+
+    qm set <VMID> --agent enabled=1
+    qm set <VMID> --ide2 <storage>:cloudinit     # if it has no cloud-init drive yet
+    qm set <VMID> --ciuser $TEMPLATE_USER         # optional, stops cloud-init adding its default user
+    qm template <VMID>
+EOF
