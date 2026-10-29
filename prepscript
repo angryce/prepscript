@@ -165,18 +165,21 @@ install_packages() {
 # -------------------------------------------------------------------- user --
 setup_user() {
     if id "$TEMPLATE_USER" >/dev/null 2>&1; then
-        log "User $TEMPLATE_USER exists, making sure it's in $SUDO_GROUP"
+        # e.g. created by cloud-init when the VM was set up with ciuser=angryce
+        log "User $TEMPLATE_USER already exists, keeping it (home, keys, shell) and making sure it's in $SUDO_GROUP"
         usermod -aG "$SUDO_GROUP" "$TEMPLATE_USER"
     else
         log "Creating user $TEMPLATE_USER"
         useradd -m -s /bin/bash -G "$SUDO_GROUP" "$TEMPLATE_USER"
     fi
 
-    # A fresh useradd leaves the password as "!" (locked). Swap that for "*":
-    # still no usable password, but sshd never treats the account as locked.
+    # A fresh useradd (or cloud-init's lock_passwd) leaves the password locked ("!").
+    # Swap that for "*": still no usable password, but sshd never treats the account as locked.
     pw_field=$(getent shadow "$TEMPLATE_USER" | cut -d: -f2)
     case "$pw_field" in
         '!'*) usermod -p '*' "$TEMPLATE_USER" ;;
+        ''|'*') ;;
+        *) warn "$TEMPLATE_USER has a password set. It's kept, so every clone of this template will share it." ;;
     esac
 
     HOME_DIR=$(getent passwd "$TEMPLATE_USER" | cut -d: -f6)
